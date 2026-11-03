@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inkfit speed</title>
+<style>
+  :root { color-scheme: dark; --bg: #16181d; --panel: #22252c; --ink: #f2f3f5; --dim: #a3a9b5; --accent: #6ea8fe; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--ink); font: 20px/1.4 system-ui, sans-serif; }
+  button { min-height: 64px; min-width: 160px; padding: 0 24px; border: 0; border-radius: 10px; background: var(--accent); color: #10131a; font: inherit; font-weight: 600; }
+  button:disabled { background: #343843; color: var(--dim); }
+  #status { margin: 16px 0; color: var(--dim); }
+  table { border-collapse: collapse; width: 100%; max-width: 760px; }
+  th, td { padding: 10px 14px; text-align: right; border-bottom: 1px solid var(--panel); }
+  th:first-child, td:first-child { text-align: left; }
+  p { max-width: 760px; color: var(--dim); }
+</style>
+</head>
+<body>
+<h1>inkfit speed</h1>
+<button id="run">Run</button>
+<div id="status">Loading</div>
+<table id="results" hidden>
+  <thead><tr><th>Shapes bound</th><th>Typical, warm</th><th>p90, warm</th><th>Slowest drawing, warm</th><th>Worst spaced fit</th><th>Share of a frame</th></tr></thead>
+  <tbody></tbody>
+</table>
+<p id="first"></p>
+<p>Warm figures come from repeated fits. Spaced fits come one at a time with a pause
+between, as an app makes them, so the share of a 60 Hz frame uses the worst of those. An
+app that is also drawing has less of that frame to spare.</p>
+<script>
+  // A module that fails to load never runs, and a headset has no console to show why.
+  window.addEventListener('error', e => {
+    document.getElementById('status').textContent = `Could not load the page: ${e.message || e.target.src || 'unknown error'}`;
+  }, true);
+</script>
+<script type="module">
+/* Fits the recorded strokes on this device, with the library's own code. When it finishes
+   it sends the numbers to the server, which prints them and saves nothing. Keep the page
+   in view while it runs: a hidden page is slowed down. */
+
+import { createFitter } from '/src/index.mjs';
+import { arrow, circle, curve, ellipse, line, outline, polyline, rectangle, square, triangle } from '/src/shapes/index.mjs';
+import { FRAME_MS, summarise, timeOne } from '/bench_run.mjs';
+
+const WARM_UP_PASSES = 2;
+
+/** How many fits are timed one at a time, and the pause before each, in milliseconds. */
+const SPACED_FITS = 40;
+const SPACED_PAUSE_MS = 30;
+
+const star = outline('star', Array.from({ length: 11 }, (_, i) => {
+  const angle = (i % 10) * Math.PI / 5;
+  const radius = i % 2 ? 0.382 : 1;
+  return { x: radius * Math.sin(angle), y: -radius * Math.cos(angle) };
+}));
+const builtIn = [line, curve, polyline, circle, ellipse, rectangle, square, triangle, arrow];
+const sets = [
+  ['5 shapes', [line, circle, rectangle, arrow, curve]],
+  ['9 built-ins', builtIn],
+  ['9 and a star', [...builtIn, star]],
+];
+
+const button = document.getElementById('run');
+const statusEl = document.getElementById('status');
+const table = document.getElementById('results');
+const rows = table.querySelector('tbody');
+const firstEl = document.getElementById('first');
+
+const now = () => performance.now();
+const ms = value => `${value.toFixed(2)} ms`;
+const breathe = (delay = 0) => new Promise(done => { setTimeout(done, delay); });
+
+/** The recordings, or null after saying why there are none. */
+async function loadDrawings() {
+  try {
+    const res = await fetch('/recordings');
+    const found = res.ok ? await res.json() : null;
+    if (Array.isArray(found) && found.length) return found;
+    statusEl.textContent = found ? 'There are no recordings to time.' : `The server couldn't read the recordings (${res.status}).`;
+  } catch (e) {
+    statusEl.textContent = `Could not reach the server: ${e.message}`;
+  }
+  return null;
+}
+
+/** How long each of a spread of drawings takes, fitted singly with a pause before it. */
+async function spacedTimes(fit, drawings) {
+  const times = [];
+  for (let i = 0; i < SPACED_FITS; i += 1) {
+    await breathe(SPACED_PAUSE_MS);
+    const { strokes } = drawings[Math.floor(i * drawings.length / SPACED_FITS)];
+    const start = now();
+    fit(strokes);
+    times.push(now() - start);
+  }
+  return times;
+}
+
+let firstFit = null;
+
+/** Sends a run's numbers to the server, and says if they didn't arrive: they stay on the page. */
+async function report(results) {
+  try {
+    const res = await fetch('/bench-results', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(results) });
+    return res.ok ? 'Sent to the server.' : `The server refused the results (${res.status}).`;
+  } catch (e) {
+    return `Could not send the results: ${e.message}`;
+  }
+}
+
+async function run(drawings) {
+  table.hidden = false;
+  rows.replaceChildren();
+  const results = [];
+  if (firstFit === null) {
+    const [name, shapes] = sets.at(-1);
+    const fit = createFitter(shapes);
+    const start = now();
+    fit(drawings[0].strokes);
+    firstFit = now() - start;
+    firstEl.textContent = `Very first fit on this page, with ${name} bound, before anything has warmed up: ${ms(firstFit)}`;
+  }
+  for (const [name, shapes] of sets) {
+    const fit = createFitter(shapes);
+    for (let pass = 0; pass < WARM_UP_PASSES; pass += 1) {
+      statusEl.textContent = `${name}: warming up`;
+      await breathe();
+      for (const d of drawings) fit(d.strokes);
+    }
+    const times = [];
+    for (let i = 0; i < drawings.length; i += 1) {
+      if (i % 20 === 0) {
+        statusEl.textContent = `${name}: ${i} of ${drawings.length}`;
+        await breathe();
+      }
+      times.push(timeOne(fit, drawings[i].strokes, now));
+    }
+    const { typical, p90, slowest } = summarise(times);
+    statusEl.textContent = `${name}: fits spaced apart`;
+    const worstSpaced = Math.max(...await spacedTimes(fit, drawings));
+    const row = document.createElement('tr');
+    for (const text of [name, ms(typical), ms(p90), ms(slowest), ms(worstSpaced), `${(100 * worstSpaced / FRAME_MS).toFixed(0)}%`]) {
+      const cell = document.createElement('td');
+      cell.textContent = text;
+      row.append(cell);
+    }
+    rows.append(row);
+    results.push({ name, typical, p90, slowest, spaced: worstSpaced });
+  }
+  statusEl.textContent = `Done. A frame at 60 Hz is 16.7 ms. ${await report({ firstFit, rows: results })}`;
+}
+
+const drawings = await loadDrawings();
+if (drawings) {
+  statusEl.textContent = `${drawings.length} recordings ready`;
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      await run(drawings);
+    } catch (e) {
+      statusEl.textContent = `The run failed: ${e.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
+} else {
+  button.disabled = true;
+}
+</script>
+</body>
+</html>

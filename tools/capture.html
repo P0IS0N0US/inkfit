@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>inkfit capture</title>
+<style>
+  :root { color-scheme: dark; --bg: #16181d; --panel: #22252c; --ink: #f2f3f5; --dim: #a3a9b5; --accent: #6ea8fe; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ink); font: 18px/1.3 system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 16px; background: var(--panel); }
+  #prompt { flex: 1 1 240px; font-size: 28px; font-weight: 600; }
+  #status { color: var(--dim); min-width: 12em; }
+  button { min-height: 56px; min-width: 96px; padding: 0 16px; border: 2px solid transparent; border-radius: 10px;
+    background: #343843; color: var(--ink); font: inherit; }
+  button[aria-pressed="true"] { border-color: var(--accent); }
+  canvas { flex: 1; min-height: 0; width: 100%; touch-action: none; cursor: crosshair; }
+</style>
+</head>
+<body>
+<header>
+  <div id="inputs"></div>
+  <div id="prompt">Loading</div>
+  <div id="status"></div>
+  <button id="drop">Drop last</button>
+</header>
+<canvas id="pad"></canvas>
+<script type="module">
+/* Turns events into Session calls and draws the result. Every recording uses plain
+   pointer moves: getCoalescedEvents needs a secure context, so a device on an
+   address would record fewer points than one on localhost. */
+
+import { Session } from '/capture_session.mjs';
+
+/** How long after a release a new stroke still belongs to the same drawing. */
+const QUIET_MS = 1500;
+
+const pad = document.getElementById('pad');
+const ctx = pad.getContext('2d');
+const promptEl = document.getElementById('prompt');
+const statusEl = document.getElementById('status');
+
+let session = null;
+let pointer = null;      // the pointer drawing the current stroke
+let captured = false;    // whether its events reach the pad wherever it goes
+let quiet = null;        // the timer ending the current drawing
+
+const shuffled = list => {
+  const out = [...list];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+};
+
+const paint = () => {
+  ctx.clearRect(0, 0, pad.clientWidth, pad.clientHeight);
+  ctx.strokeStyle = '#f2f3f5';
+  ctx.lineWidth = 3;
+  ctx.lineJoin = ctx.lineCap = 'round';
+  for (const s of session.stroke ? [...session.strokes, session.stroke] : session.strokes) {
+    ctx.beginPath();
+    s.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.stroke();
+  }
+};
+
+const render = () => {
+  promptEl.textContent = session.text;
+  statusEl.textContent = session.progress;
+  paint();
+};
+
+const size = () => {
+  const ratio = window.devicePixelRatio || 1;
+  pad.width = pad.clientWidth * ratio;
+  pad.height = pad.clientHeight * ratio;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  if (session) paint();
+};
+
+/** A pointer event's position on the pad. */
+const at = e => {
+  const box = pad.getBoundingClientRect();
+  return [e.clientX - box.left, e.clientY - box.top];
+};
+
+const send = async () => {
+  const body = JSON.stringify(session.send());
+  render();
+  try {
+    const res = await fetch('/strokes', { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+    if (!res.ok) throw new Error(String(res.status));
+    session.sent();
+  } catch {
+    session.failed();
+  }
+  render();
+};
+
+const waitForNextStroke = () => {
+  quiet = setTimeout(() => {
+    quiet = null;
+    session.finish();
+    render();
+    if (session.unsent) send();
+  }, QUIET_MS);
+};
+
+const stopWaiting = () => {
+  clearTimeout(quiet);
+  quiet = null;
+};
+
+/** Whether this event ends the stroke being drawn. */
+const endsStroke = e => {
+  if (e.pointerId !== pointer) return false;
+  pointer = null;
+  return true;
+};
+
+const interrupted = e => {
+  if (!endsStroke(e)) return;
+  session.cancel();
+  render();
+  if (session.strokes.length) waitForNextStroke();
+};
+
+pad.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  if (session.unsent) { send(); return; }
+  if (pointer !== null || !session.press(at(e))) return;
+  stopWaiting();
+  pointer = e.pointerId;
+  try {
+    pad.setPointerCapture(pointer);
+    captured = true;
+  } catch {
+    captured = false;   // the stroke still works while it stays on the pad
+  }
+  render();
+});
+
+pad.addEventListener('pointermove', e => {
+  if (e.pointerId !== pointer) return;
+  // Uncaptured, a release off the pad is never seen, and hover would join the stroke.
+  if (!captured && e.buttons === 0) { interrupted(e); return; }
+  session.move(at(e));
+  paint();
+});
+
+pad.addEventListener('pointerup', e => {
+  if (!endsStroke(e)) return;
+  session.release(at(e));
+  render();
+  waitForNextStroke();
+});
+
+pad.addEventListener('pointercancel', interrupted);
+pad.addEventListener('lostpointercapture', interrupted);
+
+document.getElementById('drop').addEventListener('click', () => {
+  stopWaiting();
+  session.drop();
+  render();
+});
+
+const config = await (await fetch('/config')).json();
+session = new Session(config.prompts, shuffled, Math.random().toString(36).slice(2));
+
+const holder = document.getElementById('inputs');
+for (const name of config.inputs) {
+  const b = document.createElement('button');
+  b.textContent = name;
+  b.setAttribute('aria-pressed', 'false');
+  b.addEventListener('click', () => {
+    session.pick(name);
+    for (const other of holder.children) other.setAttribute('aria-pressed', String(other === b));
+    render();
+  });
+  holder.append(b);
+}
+
+new ResizeObserver(size).observe(pad);
+size();
+render();
+</script>
+</body>
+</html>
